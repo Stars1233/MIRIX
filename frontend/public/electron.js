@@ -772,23 +772,13 @@ ipcMain.handle('get-capture-sources', async () => {
     // On macOS, try to get additional windows including minimized ones
     if (process.platform === 'darwin') {
       try {
-        // Try native capture helper first
+        // For cross-space detection, always use macWindowManager which has Python/Quartz support
+        // Native helper only detects visible windows on current space
         let allWindows = [];
         
-        if (nativeCaptureHelper && nativeCaptureHelper.isRunning) {
-          safeLog.log('Using native capture helper for window detection');
-          try {
-            allWindows = await nativeCaptureHelper.getAllWindows();
-          } catch (error) {
-            safeLog.log(`Native helper failed: ${error.message}, falling back to macWindowManager`);
-            const macWindowManager = require('./macWindowManager');
-            allWindows = await macWindowManager.getAllWindows();
-          }
-        } else {
-          safeLog.log('Falling back to macWindowManager for window detection');
-          const macWindowManager = require('./macWindowManager');
-          allWindows = await macWindowManager.getAllWindows();
-        }
+        safeLog.log('Using macWindowManager for cross-space window detection');
+        const macWindowManager = require('./macWindowManager');
+        allWindows = await macWindowManager.getAllWindows();
         
         // Create a map to track windows by app name for better deduplication
         const windowsByApp = new Map();
@@ -1040,20 +1030,51 @@ ipcMain.handle('get-visible-sources', async (event, sourceIds) => {
     if (sourceIds && sourceIds.length > 0) {
       safeLog.log('Checking active/focused apps for source IDs:', sourceIds);
       
-      // Get currently active app on macOS
-      let activeAppName = null;
+      // Enhanced multi-space/multi-screen visibility detection
+      let activeAppsOnAllSpaces = [];
       if (process.platform === 'darwin') {
         try {
           const { exec } = require('child_process');
           const { promisify } = require('util');
           const execAsync = promisify(exec);
           
-          // Get the frontmost (active) application
-          const { stdout } = await execAsync(`osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true'`);
-          activeAppName = stdout.trim().toLowerCase();
-          safeLog.log(`Active app: "${activeAppName}"`);
+          // Get apps that have visible windows on ANY space (not just current)
+          const { stdout: visibleAppsStdout } = await execAsync(`osascript -e '
+            tell application "System Events"
+              set visibleApps to {}
+              repeat with p in (every application process)
+                try
+                  -- Check if app has any windows
+                  if (count of windows of p) > 0 then
+                    set end of visibleApps to (name of p as string)
+                  end if
+                end try
+              end repeat
+              return my list_to_string(visibleApps, ",")
+            end tell
+            
+            on list_to_string(lst, delim)
+              set AppleScript's text item delimiters to delim
+              set str to lst as string
+              set AppleScript's text item delimiters to ""
+              return str
+            end list_to_string
+          '`);
+          
+          if (visibleAppsStdout && visibleAppsStdout.trim()) {
+            activeAppsOnAllSpaces = visibleAppsStdout.trim().toLowerCase().split(',').map(app => app.trim());
+            safeLog.log(`Apps with windows on all spaces: [${activeAppsOnAllSpaces.join(', ')}]`);
+          }
+          
+          // Also get the frontmost app on current space for additional context
+          const { stdout: frontmostStdout } = await execAsync(`osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true'`);
+          const frontmostApp = frontmostStdout.trim().toLowerCase();
+          safeLog.log(`Frontmost app on current space: "${frontmostApp}"`);
+          
         } catch (error) {
-          safeLog.log('Could not get active app:', error.message);
+          safeLog.log('Could not get apps with windows:', error.message);
+          // Fallback to assume all apps are visible
+          activeAppsOnAllSpaces = [];
         }
       }
       
@@ -1073,25 +1094,32 @@ ipcMain.handle('get-visible-sources', async (event, sourceIds) => {
           if (appNameMatch) {
             name = decodeURIComponent(appNameMatch[1]);
             
-            // Check if this app matches the active app
-            if (activeAppName) {
+            // Enhanced visibility check: app is visible if it has windows on ANY space
+            if (activeAppsOnAllSpaces.length > 0) {
               const appNameLower = name.toLowerCase();
-              const isActive = activeAppName.includes(appNameLower) || 
-                             appNameLower.includes(activeAppName) ||
-                             (appNameLower === 'msteams' && activeAppName.includes('teams')) ||
-                             (appNameLower === 'wechat' && (activeAppName.includes('wechat') || activeAppName.includes('weixin'))) ||
-                             (appNameLower === 'chrome' && activeAppName.includes('chrome'));
+              const hasWindowsOnAnySpace = activeAppsOnAllSpaces.some(activeApp => {
+                return activeApp.includes(appNameLower) || 
+                       appNameLower.includes(activeApp) ||
+                       (appNameLower === 'msteams' && activeApp.includes('teams')) ||
+                       (appNameLower === 'microsoft teams' && activeApp.includes('teams')) ||
+                       (appNameLower === 'wechat' && (activeApp.includes('wechat') || activeApp.includes('weixin'))) ||
+                       (appNameLower === 'google chrome' && activeApp.includes('chrome')) ||
+                       (appNameLower === 'visual studio code' && (activeApp.includes('code') || activeApp.includes('visual studio'))) ||
+                       (appNameLower === 'microsoft powerpoint' && (activeApp.includes('powerpoint') || activeApp.includes('microsoft powerpoint'))) ||
+                       (appNameLower === 'microsoft word' && (activeApp.includes('word') || activeApp.includes('microsoft word'))) ||
+                       (appNameLower === 'microsoft excel' && (activeApp.includes('excel') || activeApp.includes('microsoft excel')));
+              });
               
-              if (isActive) {
+              if (hasWindowsOnAnySpace) {
                 isVisible = true;
-                safeLog.log(`Virtual window is ACTIVE: ${id} -> ${name} (active app: ${activeAppName})`);
+                safeLog.log(`Virtual window has windows on some space: ${id} -> ${name}`);
               } else {
-                safeLog.log(`Virtual window not active: ${id} -> ${name} (active app: ${activeAppName})`);
+                safeLog.log(`Virtual window has no windows on any space: ${id} -> ${name}`);
               }
             } else {
-              // Fallback: if we can't detect active app, assume visible (like before)
+              // Fallback: if we can't detect apps with windows, assume visible
               isVisible = true;
-              safeLog.log(`Virtual window assumed visible (no active app detection): ${id} -> ${name}`);
+              safeLog.log(`Virtual window assumed visible (no space detection): ${id} -> ${name}`);
             }
           }
         } else {

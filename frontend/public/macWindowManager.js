@@ -57,7 +57,7 @@ try:
     from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionAll, kCGNullWindowID
     import json
     
-    # Get all windows including off-screen ones
+    # Get all windows including off-screen ones and windows on other spaces
     window_list = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)
     
     windows = []
@@ -65,44 +65,82 @@ try:
                      'Microsoft Teams', 'MSTeams', 'Teams', 'Discord', 'Google Chrome',
                      'Microsoft Word', 'Microsoft Excel', 'Keynote', 'Figma',
                      'Sketch', 'Adobe Photoshop', 'Visual Studio Code', 'Cursor',
-                     'Safari', 'Firefox', 'WeChat', 'Obsidian']
+                     'Safari', 'Firefox', 'WeChat', 'Obsidian', 'Chrome']
+    
+    # Group windows by app to get the best representative window
+    app_windows = {}
     
     for window in window_list:
         if window.get('kCGWindowOwnerName') and window.get('kCGWindowNumber'):
             app_name = window['kCGWindowOwnerName']
             
-            # Skip system apps
-            if app_name in ['SystemUIServer', 'Dock', 'ControlCenter', 'WindowManager', 'MIRIX', 'Electron']:
+            # Skip system apps but be less restrictive
+            if app_name in ['SystemUIServer', 'Dock', 'ControlCenter', 'WindowManager', 'MIRIX', 'Electron', 'Finder']:
                 continue
             
-            # Only include important apps or windows with content
-            is_important = any(app.lower() in app_name.lower() for app in important_apps)
-            has_content = window.get('kCGWindowName', '').strip() != ''
-            
-            if not (is_important or has_content):
-                continue
-                
-            # Get bounds - be more permissive with size
+            # Get bounds - be more permissive with size for cross-space windows
             bounds = window.get('kCGWindowBounds', {})
-            if bounds.get('Width', 0) < 10 or bounds.get('Height', 0) < 10:
+            width = bounds.get('Width', 0)
+            height = bounds.get('Height', 0)
+            
+            # Very small windows are likely not main windows
+            if width < 50 or height < 50:
                 continue
             
-            # Be more permissive with layers for important apps
+            # Be more permissive with layers - apps on other spaces might have higher layers
             layer = window.get('kCGWindowLayer', 0)
-            if layer > 100:  # Very high layers are usually system elements
+            if layer > 200:  # Only exclude very high system layers
                 continue
-                
-            windows.append({
+            
+            # Check if this is an important app or has meaningful content
+            is_important = any(app.lower() in app_name.lower() or app_name.lower() in app.lower() for app in important_apps)
+            has_content = window.get('kCGWindowName', '').strip() != ''
+            window_title = window.get('kCGWindowName', '')
+            
+            # Include if important app OR has substantial content OR reasonable size
+            should_include = (
+                is_important or 
+                has_content or 
+                (width > 300 and height > 200)  # Reasonable size suggests main window
+            )
+            
+            if not should_include:
+                continue
+            
+            window_info = {
                 'windowId': window['kCGWindowNumber'],
                 'appName': app_name,
-                'windowTitle': window.get('kCGWindowName', ''),
+                'windowTitle': window_title,
                 'bounds': bounds,
                 'isOnScreen': window.get('kCGWindowIsOnscreen', False),
                 'layer': layer,
-                'isImportant': is_important
-            })
+                'isImportant': is_important,
+                'area': width * height
+            }
+            
+            # Group by app name to find best representative window
+            if app_name not in app_windows:
+                app_windows[app_name] = []
+            app_windows[app_name].append(window_info)
     
-    # Sort by importance and then by app name
+    # Select best window for each app
+    for app_name, app_window_list in app_windows.items():
+        if not app_window_list:
+            continue
+            
+        # Sort windows by preference: important apps first, then by area, then by layer
+        def window_score(w):
+            return (
+                w['isImportant'],           # Important apps first
+                w['area'],                  # Larger windows preferred
+                -w['layer'],                # Lower layers preferred (negative for descending)
+                bool(w['windowTitle'])      # Windows with titles preferred
+            )
+        
+        best_window = max(app_window_list, key=window_score)
+        windows.append(best_window)
+    
+    # Sort final list by importance and then by app name
     windows.sort(key=lambda x: (not x['isImportant'], x['appName']))
     
     print(json.dumps(windows))
@@ -111,6 +149,7 @@ except ImportError:
     # Fallback if Quartz is not available
     print("[]")
 except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
     print("[]")
 `;
 
